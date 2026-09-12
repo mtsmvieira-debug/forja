@@ -1,0 +1,1834 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Forja Treino</title>
+<meta name="description" content="App de treino: área do aluno e área do admin/treinador." />
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // -----------------------------------------------------------------
+  // Shim de armazenamento: o app original foi feito para rodar dentro
+  // dos Artifacts da Claude, que expõem window.storage.get/set (com
+  // persistência gerenciada pela Anthropic). Fora desse ambiente (aqui,
+  // como site estático) não existe esse backend, então recriamos a
+  // mesma assinatura de API usando localStorage do navegador — assim
+  // o resto do código do app não precisa mudar nenhuma linha.
+  // Observação: dados ficam salvos só no navegador/dispositivo de quem
+  // acessa (não são compartilhados entre pessoas ou dispositivos).
+  // -----------------------------------------------------------------
+  window.storage = {
+    get: function (key, shared) {
+      return new Promise(function (resolve) {
+        try {
+          var v = localStorage.getItem(key);
+          if (v === null || v === undefined) {
+            resolve(null);
+          } else {
+            resolve({ key: key, value: v, shared: !!shared });
+          }
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    },
+    set: function (key, value, shared) {
+      return new Promise(function (resolve) {
+        try {
+          localStorage.setItem(key, value);
+          resolve({ key: key, value: value, shared: !!shared });
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    },
+  };
+</script>
+
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useState, useEffect, useCallback, useMemo } from "https://esm.sh/react@18.3.1";
+import ReactDOM from "https://esm.sh/react-dom@18.3.1/client";
+import {
+  Dumbbell,
+  Home,
+  Settings,
+  Play,
+  Plus,
+  Trash2,
+  X,
+  Check,
+  ChevronLeft,
+  ArrowLeft,
+  ArrowRight,
+  SkipForward,
+  Flame,
+  Users,
+  ListChecks,
+  Pencil,
+  Timer,
+} from "https://esm.sh/lucide-react@0.469.0?external=react";
+
+
+/* ----------------------------------------------------------------------
+   CONSTANTES
+---------------------------------------------------------------------- */
+
+const DATA_KEY = "forja-treino-data-v1";
+const CURRENT_STUDENT_KEY = "forja-treino-current-student";
+
+// Ordem de exibição do calendário (usada só na grade de frequência).
+// Índice real usa o padrão do JS Date.getDay() (0 = Domingo ... 6 = Sábado).
+const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
+const WEEKDAY_SHORT = {
+  1: "SEG",
+  2: "TER",
+  3: "QUA",
+  4: "QUI",
+  5: "SEX",
+  6: "SÁB",
+  0: "DOM",
+};
+
+// Letras dos treinos (Treino A, B, C...), na ordem em que o treinador monta.
+const LETTERS = "ABCDEFGHIJKL".split("");
+
+const THERMO_LEVELS = [
+  { level: 1, label: "Não curti", color: "#4A6FA5" },
+  { level: 2, label: "Fraquinho", color: "#6E8F6B" },
+  { level: 3, label: "Tranquilo", color: "#C9B458" },
+  { level: 4, label: "Gostei", color: "#D9822B" },
+  { level: 5, label: "Amei", color: "#C0392B" },
+];
+
+const PLANO_LABEL = { casa: "Treino em casa", academia: "Treino na academia" };
+
+/* ----------------------------------------------------------------------
+   HELPERS
+---------------------------------------------------------------------- */
+
+function uid(prefix) {
+  return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function localISO(date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function prettyDate(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  const meses = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+  return `${d} de ${meses[m - 1]}`;
+}
+
+function last14Dates() {
+  const out = [];
+  const today = new Date();
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(today.getDate() - i);
+    out.push({ iso: localISO(d), weekday: d.getDay() });
+  }
+  return out;
+}
+
+function splitTags(str) {
+  return (str || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// Tenta converter um link de vídeo (YouTube ou Vimeo) numa URL de embed
+// para tocar dentro do próprio app. Retorna null se não for possível
+// (ex: link de busca, ou site não suportado) — nesse caso caímos no
+// comportamento antigo de abrir o link numa aba nova.
+function getEmbedUrl(url) {
+  if (!url) return null;
+  let u;
+  try {
+    u = new URL(url);
+  } catch (e) {
+    return null;
+  }
+  const host = u.hostname.replace(/^www\.|^m\./, "");
+
+  if (host === "youtube.com") {
+    if (u.pathname === "/watch") {
+      const id = u.searchParams.get("v");
+      return id ? `https://www.youtube.com/embed/${id}` : null;
+    }
+    if (u.pathname.startsWith("/shorts/")) {
+      const id = u.pathname.split("/")[2];
+      return id ? `https://www.youtube.com/embed/${id}` : null;
+    }
+    if (u.pathname.startsWith("/embed/")) {
+      return url;
+    }
+    return null;
+  }
+  if (host === "youtu.be") {
+    const id = u.pathname.slice(1);
+    return id ? `https://www.youtube.com/embed/${id}` : null;
+  }
+  if (host === "vimeo.com") {
+    const id = u.pathname.split("/").filter(Boolean)[0];
+    return id && /^\d+$/.test(id) ? `https://player.vimeo.com/video/${id}` : null;
+  }
+  return null;
+}
+
+// Anexa a letra (A, B, C...) de acordo com a posição de cada treino no array.
+function withLetters(scheduleArr) {
+  return (scheduleArr || []).map((day, idx) => ({ ...day, letra: LETTERS[idx] || `#${idx + 1}` }));
+}
+
+// Só os treinos que já têm pelo menos um exercício — é isso que forma a
+// rotação que o aluno realmente vê e percorre.
+function activeRotation(scheduleArr) {
+  return withLetters(scheduleArr).filter((d) => (d.items || []).length > 0);
+}
+
+// Converte dados salvos no formato antigo (por dia da semana) para o novo
+// formato por letra, preservando a ordem e o histórico já registrado.
+function migrateData(loaded) {
+  if (!loaded || !loaded.students) return loaded;
+  const isOldFormat = loaded.students.some((s) => {
+    const sched = loaded.schedules ? loaded.schedules[s.id] : null;
+    return sched && !Array.isArray(sched);
+  });
+  if (!isOldFormat) return loaded;
+
+  const schedules = {};
+  const weekdayToLetter = {};
+  loaded.students.forEach((s) => {
+    const oldSched = (loaded.schedules && loaded.schedules[s.id]) || {};
+    const activeWeekdays = WEEKDAY_ORDER.filter((w) => (oldSched[w] || []).length > 0);
+    schedules[s.id] = activeWeekdays.map((w) => ({ id: uid("day"), items: oldSched[w] }));
+    const map = {};
+    activeWeekdays.forEach((w, i) => {
+      map[w] = LETTERS[i] || `#${i + 1}`;
+    });
+    weekdayToLetter[s.id] = map;
+  });
+
+  const logs = {};
+  Object.keys(loaded.logs || {}).forEach((sid) => {
+    logs[sid] = {};
+    const map = weekdayToLetter[sid] || {};
+    Object.keys(loaded.logs[sid]).forEach((iso) => {
+      const log = loaded.logs[sid][iso];
+      const { weekday, ...rest } = log;
+      logs[sid][iso] = { ...rest, letra: map[weekday] || log.letra || "?" };
+    });
+  });
+
+  return { ...loaded, schedules, logs };
+}
+
+/* ----------------------------------------------------------------------
+   DADOS PADRÃO (usados na primeira vez que o app abre)
+---------------------------------------------------------------------- */
+
+function buildDefaultData() {
+  const ex1 = { id: "ex_agachamento", nome: "Agachamento livre", categoria: "academia", video: "https://www.youtube.com/results?search_query=como+fazer+agachamento+livre+execu%C3%A7%C3%A3o", series: 4, reps: "10-12", particularidades: "", descanso: 60 };
+  const ex2 = { id: "ex_flexao", nome: "Flexão de braço", categoria: "ambos", video: "https://www.youtube.com/results?search_query=como+fazer+flex%C3%A3o+de+bra%C3%A7o+execu%C3%A7%C3%A3o", series: 3, reps: "até a falha", particularidades: "", descanso: 45 };
+  const ex3 = { id: "ex_afundo", nome: "Afundo", categoria: "ambos", video: "https://www.youtube.com/results?search_query=como+fazer+afundo+execu%C3%A7%C3%A3o", series: 3, reps: "12 cada perna", particularidades: "", descanso: 45 };
+  const ex4 = { id: "ex_supino", nome: "Supino reto com barra", categoria: "academia", video: "https://www.youtube.com/results?search_query=como+fazer+supino+reto+com+barra", series: 4, reps: "8-10", particularidades: "Drop set na última série", descanso: 90 };
+  const ex5 = { id: "ex_prancha", nome: "Prancha abdominal", categoria: "ambos", video: "https://www.youtube.com/results?search_query=como+fazer+prancha+abdominal+execu%C3%A7%C3%A3o", series: 3, reps: "40s", particularidades: "Isometria", descanso: 30 };
+  const ex6 = { id: "ex_remada", nome: "Remada curvada", categoria: "academia", video: "https://www.youtube.com/results?search_query=como+fazer+remada+curvada+execu%C3%A7%C3%A3o", series: 4, reps: "10-12", particularidades: "", descanso: 60 };
+
+  const s1 = { id: "st_marina", nome: "Marina Souza", plano: "academia" };
+  const s2 = { id: "st_rafael", nome: "Rafael Lima", plano: "casa" };
+
+  const mkItem = (ex) => ({ id: uid("it"), exercicioId: ex.id, series: ex.series, reps: ex.reps, particularidades: ex.particularidades, descanso: ex.descanso });
+
+  const schedules = {
+    [s1.id]: [
+      { id: uid("day"), items: [mkItem(ex1), mkItem(ex4)] }, // Treino A
+      { id: uid("day"), items: [mkItem(ex6), mkItem(ex5)] }, // Treino B
+      { id: uid("day"), items: [mkItem(ex1), mkItem(ex4), mkItem(ex5)] }, // Treino C
+    ],
+    [s2.id]: [
+      { id: uid("day"), items: [mkItem(ex2), mkItem(ex3), mkItem(ex5)] }, // Treino A
+      { id: uid("day"), items: [mkItem(ex3), mkItem(ex2)] }, // Treino B
+    ],
+  };
+
+  // um pequeno histórico de exemplo para a Marina, para a tela de frequência
+  // já nascer com algo pra mostrar
+  const logs = { [s1.id]: {}, [s2.id]: {} };
+  const days = last14Dates();
+  const rotation = ["A", "B", "C"];
+  days.forEach((d, idx) => {
+    if (idx < 12 && idx % 2 === 0) {
+      const wasDone = idx % 4 !== 0;
+      logs[s1.id][d.iso] = {
+        id: uid("log"),
+        done: wasDone,
+        skipped: !wasDone,
+        thermometer: wasDone ? 2 + (idx % 4) : null,
+        letra: rotation[(idx / 2) % rotation.length],
+      };
+    }
+  });
+
+  return { students: [s1, s2], exercises: [ex1, ex2, ex3, ex4, ex5, ex6], schedules, logs, progress: {} };
+}
+
+/* ----------------------------------------------------------------------
+   COMPONENTES PEQUENOS
+---------------------------------------------------------------------- */
+
+function Badge({ children, tone = "neutral" }) {
+  return <span className={`fj-badge fj-badge--${tone}`}>{children}</span>;
+}
+
+function Thermometer({ value, onChange, size = "md" }) {
+  return (
+    <div className={`fj-thermo fj-thermo--${size}`}>
+      {THERMO_LEVELS.map((t) => (
+        <button
+          key={t.level}
+          type="button"
+          className="fj-thermo__seg"
+          style={{
+            background: value >= t.level ? t.color : "var(--line)",
+            opacity: value && value < t.level ? 0.5 : 1,
+          }}
+          onClick={() => onChange(t.level)}
+          title={t.label}
+          aria-label={t.label}
+        />
+      ))}
+      <span className="fj-thermo__label" style={{ color: value ? THERMO_LEVELS[value - 1].color : "var(--steel-light)" }}>
+        {value ? THERMO_LEVELS[value - 1].label : "Toque para avaliar"}
+      </span>
+    </div>
+  );
+}
+
+function Modal({ title, onClose, children, wide }) {
+  return (
+    <div className="fj-modal-backdrop" onClick={onClose}>
+      <div className={`fj-modal ${wide ? "fj-modal--wide" : ""}`} onClick={(e) => e.stopPropagation()}>
+        <div className="fj-modal__head">
+          <h3>{title}</h3>
+          <button className="fj-iconbtn" onClick={onClose} aria-label="Fechar">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="fj-modal__body">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="fj-field">
+      <span>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function VideoModal({ titulo, embedUrl, onClose }) {
+  return (
+    <Modal title={titulo} onClose={onClose} wide>
+      <div className="fj-videoWrap">
+        <iframe
+          src={embedUrl}
+          title={titulo}
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+          allowFullScreen
+        />
+      </div>
+    </Modal>
+  );
+}
+
+// Quando não dá pra incorporar o vídeo (link não reconhecido), mostramos o
+// link para copiar em vez de tentar abrir — abrir link/nova aba não é
+// confiável dentro do preview do app, então evitamos qualquer navegação.
+function VideoLinkModal({ url, onClose }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <Modal title="Link do vídeo" onClose={onClose}>
+      <p className="fj-videoLinkModal__hint">
+        Não conseguimos tocar esse vídeo aqui dentro do app. Copie o link e cole no navegador ou no YouTube para assistir:
+      </p>
+      <div className="fj-videoLinkModal__url">{url}</div>
+      <div className="fj-form__actions">
+        <button type="button" className="fj-btn" onClick={onClose}>
+          Fechar
+        </button>
+        <button type="button" className="fj-btn fj-btn--primary" onClick={copy}>
+          {copied ? "Link copiado!" : "Copiar link"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+// Cronômetro de descanso entre séries, com anel de progresso.
+function RestTimer({ seconds, onDone }) {
+  const total = Math.max(1, seconds || 60);
+  const [remaining, setRemaining] = useState(total);
+  const [running, setRunning] = useState(true);
+
+  useEffect(() => {
+    if (!running || remaining <= 0) return;
+    const t = setTimeout(() => setRemaining((r) => Math.max(0, r - 1)), 1000);
+    return () => clearTimeout(t);
+  }, [running, remaining]);
+
+  const done = remaining <= 0;
+  const pct = remaining / total;
+  const r = 26;
+  const circumference = 2 * Math.PI * r;
+
+  return (
+    <div className={`fj-restTimer ${done ? "is-done" : ""}`}>
+      <div className="fj-restTimer__ringWrap">
+        <svg viewBox="0 0 64 64" className="fj-restTimer__ring">
+          <circle cx="32" cy="32" r={r} className="fj-restTimer__track" />
+          <circle
+            cx="32"
+            cy="32"
+            r={r}
+            className="fj-restTimer__progress"
+            style={{
+              strokeDasharray: circumference,
+              strokeDashoffset: circumference * (1 - pct),
+            }}
+          />
+        </svg>
+        <span className="fj-restTimer__time">{done ? <Check size={18} /> : remaining}</span>
+      </div>
+      <div className="fj-restTimer__body">
+        <p className="fj-restTimer__label">{done ? "Descanso concluído!" : "Descansando..."}</p>
+        <div className="fj-restTimer__controls">
+          <button type="button" className="fj-btn fj-btn--small" onClick={() => setRemaining((r) => r + 15)}>
+            +15s
+          </button>
+          <button type="button" className="fj-btn fj-btn--small" onClick={() => setRunning((r) => !r)} disabled={done}>
+            {running ? "Pausar" : "Continuar"}
+          </button>
+          <button type="button" className="fj-btn fj-btn--small fj-btn--primary" onClick={onDone}>
+            Fechar
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+// Vimeo); senão mostra o link pra copiar, sem tentar abrir/navegar.
+function VideoButton({ url, label = "vídeo" }) {
+  const [open, setOpen] = useState(false);
+  const embedUrl = getEmbedUrl(url);
+
+  return (
+    <>
+      <button type="button" className="fj-videoBtn" onClick={() => setOpen(true)}>
+        <Play size={13} /> {label}
+      </button>
+      {open && embedUrl && <VideoModal titulo="Vídeo de execução" embedUrl={embedUrl} onClose={() => setOpen(false)} />}
+      {open && !embedUrl && <VideoLinkModal url={url} onClose={() => setOpen(false)} />}
+    </>
+  );
+}
+
+/* ----------------------------------------------------------------------
+   ÁREA DO ALUNO
+---------------------------------------------------------------------- */
+
+function AlunoView({
+  data,
+  exercisesById,
+  currentStudentId,
+  setCurrentStudentId,
+  completeWorkout,
+  skipWorkout,
+  setThermometer,
+  continueToNext,
+  undoLast,
+  dismissSkipBanner,
+}) {
+  const student = data.students.find((s) => s.id === currentStudentId) || null;
+  const [timerItemId, setTimerItemId] = useState(null);
+
+  if (data.students.length === 0) {
+    return (
+      <div className="fj-empty">
+        <Dumbbell size={32} />
+        <p>Ainda não há alunos cadastrados. Peça para o seu treinador te cadastrar na área do admin.</p>
+      </div>
+    );
+  }
+
+  if (!student) {
+    return (
+      <div className="fj-alunoPicker">
+        <h2>Quem é você?</h2>
+        <p>Escolha seu nome para ver o seu treino.</p>
+        <div className="fj-alunoPicker__list">
+          {data.students.map((s) => (
+            <button key={s.id} className="fj-alunoPicker__item" onClick={() => setCurrentStudentId(s.id)}>
+              <span>{s.nome}</span>
+              <Badge tone={s.plano === "casa" ? "steel" : "lime"}>{PLANO_LABEL[s.plano]}</Badge>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const schedule = data.schedules[student.id] || [];
+  const rotation = activeRotation(schedule);
+  const progress = (data.progress && data.progress[student.id]) || { pointerIndex: 0, pendingLogId: null };
+  const studentLogs = data.logs[student.id] || {};
+
+  const pendingEntry = progress.pendingLogId
+    ? Object.entries(studentLogs).find(([, log]) => log.id === progress.pendingLogId)
+    : null;
+
+  const skipBanner =
+    !pendingEntry && progress.lastType === "skip" && progress.lastLogId
+      ? Object.entries(studentLogs).find(([, log]) => log.id === progress.lastLogId)
+      : null;
+
+  const pointerIndex = rotation.length ? progress.pointerIndex % rotation.length : 0;
+  const currentWorkout = rotation.length ? rotation[pointerIndex] : null;
+  const items = currentWorkout ? currentWorkout.items || [] : [];
+
+  return (
+    <div className="fj-aluno">
+      <div className="fj-aluno__top">
+        <div>
+          <p className="fj-eyebrow">Olá,</p>
+          <h2 className="fj-h1">{student.nome.split(" ")[0]}</h2>
+        </div>
+        <div className="fj-aluno__topRight">
+          <Badge tone={student.plano === "casa" ? "steel" : "lime"}>{PLANO_LABEL[student.plano]}</Badge>
+          <button className="fj-linklike" onClick={() => setCurrentStudentId(null)}>
+            trocar aluno
+          </button>
+        </div>
+      </div>
+
+      {rotation.length === 0 ? (
+        <div className="fj-empty fj-empty--rest">
+          <Flame size={26} />
+          <p>Seu treinador ainda não montou nenhum treino pra você.</p>
+        </div>
+      ) : pendingEntry ? (
+        <div className="fj-doneBox">
+          <div className="fj-doneBox__confirmed">
+            <Check size={16} /> Treino {pendingEntry[1].letra} concluído
+          </div>
+          <p className="fj-doneBox__ask">O que você achou desse treino?</p>
+          <Thermometer value={pendingEntry[1].thermometer} onChange={(v) => setThermometer(student.id, pendingEntry[0], v)} />
+          <div className="fj-doneBox__continue">
+            <button className="fj-linklike fj-linklike--back" onClick={() => undoLast(student.id)}>
+              <ChevronLeft size={14} /> voltar
+            </button>
+            <button className="fj-btn fj-btn--primary" onClick={() => continueToNext(student.id)}>
+              Continuar para o próximo treino <ArrowRight size={16} />
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          {skipBanner && (
+            <div className="fj-skipBanner">
+              <span>
+                <SkipForward size={14} /> Treino {skipBanner[1].letra} pulado
+              </span>
+              <div className="fj-skipBanner__actions">
+                <button className="fj-linklike" onClick={() => undoLast(student.id)}>
+                  desfazer
+                </button>
+                <button className="fj-iconbtn fj-iconbtn--flat" onClick={() => dismissSkipBanner(student.id)} aria-label="Fechar aviso">
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="fj-rotationRow">
+            {rotation.map((w, i) => (
+              <span key={w.id} className={`fj-rotationPill ${i === pointerIndex ? "is-current" : ""}`}>
+                {w.letra}
+              </span>
+            ))}
+          </div>
+
+          <h3 className="fj-sectionTitle">Treino de hoje — Treino {currentWorkout.letra}</h3>
+
+          <div className="fj-exList">
+            {items.map((item, idx) => {
+              const ex = exercisesById[item.exercicioId];
+              if (!ex) return null;
+              const tags = splitTags(item.particularidades);
+              return (
+                <div className="fj-exCard" key={item.id}>
+                  <div className="fj-exCard__num">{idx + 1}</div>
+                  <div className="fj-exCard__body">
+                    <div className="fj-exCard__head">
+                      <h4>{ex.nome}</h4>
+                      {ex.video && <VideoButton url={ex.video} />}
+                    </div>
+                    <div className="fj-exCard__meta">
+                      <span className="fj-setrep">
+                        {item.series}x {item.reps}
+                      </span>
+                      {tags.map((t) => (
+                        <Badge key={t} tone="rust">
+                          {t}
+                        </Badge>
+                      ))}
+                      {!!(item.descanso ?? ex.descanso) && (
+                        <button
+                          type="button"
+                          className="fj-restChip"
+                          onClick={() => setTimerItemId(timerItemId === item.id ? null : item.id)}
+                        >
+                          <Timer size={12} /> {item.descanso ?? ex.descanso}s descanso
+                        </button>
+                      )}
+                    </div>
+                    {timerItemId === item.id && (
+                      <RestTimer seconds={item.descanso ?? ex.descanso} onDone={() => setTimerItemId(null)} key={item.id} />
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="fj-actionRow">
+            <button className="fj-btn fj-btn--primary fj-btn--big" onClick={() => completeWorkout(student.id, currentWorkout.letra)}>
+              <Check size={18} /> Treino feito
+            </button>
+            <button className="fj-btn fj-btn--ghost fj-btn--big" onClick={() => skipWorkout(student.id, currentWorkout.letra)}>
+              <SkipForward size={18} /> Pular
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------
+   ADMIN — EXERCÍCIOS
+---------------------------------------------------------------------- */
+
+function ExercicioForm({ initial, onSave, onCancel }) {
+  const [form, setForm] = useState(
+    initial || { nome: "", categoria: "ambos", series: 3, reps: "", particularidades: "", video: "", descanso: 60 }
+  );
+  const [error, setError] = useState(false);
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  const handleSave = () => {
+    if (!form.nome.trim()) {
+      setError(true);
+      return;
+    }
+    onSave({ ...form, series: Number(form.series) || 1, descanso: Number(form.descanso) || 0 });
+  };
+
+  return (
+    <div className="fj-form">
+      <Field label="Nome do exercício">
+        <input value={form.nome} onChange={set("nome")} placeholder="Ex: Agachamento livre" autoFocus />
+      </Field>
+      {error && <p className="fj-formError">Dá um nome para o exercício antes de salvar.</p>}
+      <Field label="Onde pode ser feito">
+        <select value={form.categoria} onChange={set("categoria")}>
+          <option value="ambos">Casa e academia</option>
+          <option value="casa">Só em casa</option>
+          <option value="academia">Só na academia</option>
+        </select>
+      </Field>
+      <div className="fj-form__row">
+        <Field label="Séries (padrão)">
+          <input type="number" min="1" value={form.series} onChange={set("series")} />
+        </Field>
+        <Field label="Repetições (padrão)">
+          <input value={form.reps} onChange={set("reps")} placeholder="Ex: 10-12 ou até a falha" />
+        </Field>
+      </div>
+      <Field label="Descanso entre séries (segundos)">
+        <input type="number" min="0" step="5" value={form.descanso} onChange={set("descanso")} placeholder="Ex: 60" />
+      </Field>
+      <Field label="Particularidades (padrão, separe por vírgula)">
+        <input value={form.particularidades} onChange={set("particularidades")} placeholder="Ex: Drop set, Isometria 20s" />
+      </Field>
+      <Field label="Link do vídeo de execução">
+        <input value={form.video} onChange={set("video")} placeholder="https://..." />
+      </Field>
+      <div className="fj-form__actions">
+        <button type="button" className="fj-btn" onClick={onCancel}>
+          Cancelar
+        </button>
+        <button type="button" className="fj-btn fj-btn--primary" onClick={handleSave}>
+          Salvar exercício
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AdminExercicios({ data, saveExercise, deleteExercise }) {
+  const [editing, setEditing] = useState(null); // null | 'new' | exercise object
+  return (
+    <div className="fj-panel">
+      <div className="fj-panel__head">
+        <h3>Biblioteca de exercícios</h3>
+        <button className="fj-btn fj-btn--primary" onClick={() => setEditing("new")}>
+          <Plus size={16} /> Novo exercício
+        </button>
+      </div>
+
+      <div className="fj-exGrid">
+        {data.exercises.map((ex) => {
+          const tags = splitTags(ex.particularidades);
+          return (
+            <div className="fj-exGridCard" key={ex.id}>
+              <div className="fj-exGridCard__top">
+                <h4>{ex.nome}</h4>
+                <Badge tone={ex.categoria === "casa" ? "steel" : ex.categoria === "academia" ? "lime" : "neutral"}>
+                  {ex.categoria === "ambos" ? "casa e academia" : ex.categoria}
+                </Badge>
+              </div>
+              <p className="fj-setrep">
+                {ex.series}x {ex.reps || "—"}
+                {ex.descanso ? ` · ${ex.descanso}s descanso` : ""}
+              </p>
+              {tags.length > 0 && (
+                <div className="fj-exGridCard__tags">
+                  {tags.map((t) => (
+                    <Badge key={t} tone="rust">
+                      {t}
+                    </Badge>
+                  ))}
+                </div>
+              )}
+              {ex.video && <VideoButton url={ex.video} label="ver vídeo" />}
+              <div className="fj-exGridCard__actions">
+                <button className="fj-iconbtn" onClick={() => setEditing(ex)} aria-label="Editar">
+                  <Pencil size={15} />
+                </button>
+                <button className="fj-iconbtn fj-iconbtn--danger" onClick={() => deleteExercise(ex.id)} aria-label="Excluir">
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {editing && (
+        <Modal title={editing === "new" ? "Novo exercício" : "Editar exercício"} onClose={() => setEditing(null)}>
+          <ExercicioForm
+            initial={editing === "new" ? null : editing}
+            onCancel={() => setEditing(null)}
+            onSave={(form) => {
+              saveExercise(editing === "new" ? { ...form, id: uid("ex") } : { ...editing, ...form });
+              setEditing(null);
+            }}
+          />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------
+   ADMIN — PLANO SEMANAL DE UM ALUNO
+---------------------------------------------------------------------- */
+
+function AdminPlanoSemanal({ student, data, addWorkoutDay, removeWorkoutDay, moveWorkoutDay, addItem, updateItem, removeItem }) {
+  const rotation = withLetters(data.schedules[student.id] || []);
+  const [selectedId, setSelectedId] = useState(rotation[0] ? rotation[0].id : null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const prevCountRef = React.useRef(rotation.length);
+  const prevStudentRef = React.useRef(student.id);
+
+  useEffect(() => {
+    const list = withLetters(data.schedules[student.id] || []);
+    if (prevStudentRef.current !== student.id) {
+      // trocou de aluno: sempre volta pro primeiro treino, sem comparar contagem
+      setSelectedId(list[0] ? list[0].id : null);
+    } else if (list.length > prevCountRef.current) {
+      // um novo treino foi criado (sempre no fim da lista) — seleciona ele
+      setSelectedId(list[list.length - 1].id);
+    } else if (!list.find((d) => d.id === selectedId)) {
+      setSelectedId(list[0] ? list[0].id : null);
+    }
+    prevCountRef.current = list.length;
+    prevStudentRef.current = student.id;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [student.id, data.schedules[student.id]]);
+
+  const current = rotation.find((d) => d.id === selectedId) || null;
+  const currentIdx = current ? rotation.findIndex((d) => d.id === current.id) : -1;
+  const items = current ? current.items : [];
+
+  return (
+    <div>
+      <div className="fj-daystrip">
+        {rotation.map((d) => (
+          <button key={d.id} className={`fj-daystrip__day ${d.id === selectedId ? "is-active" : ""}`} onClick={() => setSelectedId(d.id)}>
+            {d.letra}
+            {d.items.length > 0 && <span className="fj-daystrip__dot" />}
+          </button>
+        ))}
+        <button
+          className="fj-daystrip__add"
+          onClick={() => {
+            addWorkoutDay(student.id);
+          }}
+          aria-label="Adicionar treino"
+          title="Adicionar novo treino"
+        >
+          <Plus size={16} />
+        </button>
+      </div>
+
+      {!current ? (
+        <div className="fj-empty fj-empty--rest">
+          <p>Nenhum treino criado ainda para {student.nome.split(" ")[0]}. Clique no + para começar o Treino A.</p>
+        </div>
+      ) : (
+        <>
+          <div className="fj-panel__head fj-panel__head--tight">
+            <h4>Treino {current.letra}</h4>
+            <div className="fj-planToolbar">
+              <button
+                className="fj-iconbtn"
+                onClick={() => moveWorkoutDay(student.id, current.id, -1)}
+                disabled={currentIdx <= 0}
+                aria-label="Mover treino para cima na ordem"
+                title="Mover antes"
+              >
+                ↑
+              </button>
+              <button
+                className="fj-iconbtn"
+                onClick={() => moveWorkoutDay(student.id, current.id, 1)}
+                disabled={currentIdx === -1 || currentIdx >= rotation.length - 1}
+                aria-label="Mover treino para baixo na ordem"
+                title="Mover depois"
+              >
+                ↓
+              </button>
+              <button className="fj-btn fj-btn--primary fj-btn--small" onClick={() => setPickerOpen(true)}>
+                <Plus size={14} /> Adicionar exercício
+              </button>
+              <button
+                className="fj-iconbtn fj-iconbtn--danger"
+                onClick={() => {
+                  if (confirm(`Remover o Treino ${current.letra} inteiro?`)) removeWorkoutDay(student.id, current.id);
+                }}
+                aria-label="Remover este treino"
+              >
+                <Trash2 size={15} />
+              </button>
+            </div>
+          </div>
+
+          {items.length === 0 ? (
+            <div className="fj-empty fj-empty--rest">
+              <p>O Treino {current.letra} ainda não tem exercícios. Adicione pelo menos um para ele entrar na rotação do aluno.</p>
+            </div>
+          ) : (
+            <div className="fj-planList">
+              {items.map((item) => {
+                const ex = data.exercises.find((e) => e.id === item.exercicioId);
+                if (!ex) return null;
+                return (
+                  <div className="fj-planItem" key={item.id}>
+                    <div className="fj-planItem__name">{ex.nome}</div>
+                    <div className="fj-planItem__inputs">
+                      <input
+                        type="number"
+                        min="1"
+                        value={item.series}
+                        onChange={(e) => updateItem(student.id, current.id, item.id, { series: Number(e.target.value) || 1 })}
+                      />
+                      <span className="fj-planItem__x">x</span>
+                      <input
+                        value={item.reps}
+                        onChange={(e) => updateItem(student.id, current.id, item.id, { reps: e.target.value })}
+                        placeholder="reps"
+                        className="fj-planItem__reps"
+                      />
+                      <div className="fj-planItem__rest">
+                        <Timer size={13} />
+                        <input
+                          type="number"
+                          min="0"
+                          step="5"
+                          value={item.descanso ?? ex.descanso ?? 60}
+                          onChange={(e) => updateItem(student.id, current.id, item.id, { descanso: Number(e.target.value) || 0 })}
+                        />
+                        <span>s</span>
+                      </div>
+                      <input
+                        value={item.particularidades}
+                        onChange={(e) => updateItem(student.id, current.id, item.id, { particularidades: e.target.value })}
+                        placeholder="particularidades (drop set, isometria...)"
+                        className="fj-planItem__part"
+                      />
+                    </div>
+                    <button className="fj-iconbtn fj-iconbtn--danger" onClick={() => removeItem(student.id, current.id, item.id)} aria-label="Remover">
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+
+      {pickerOpen && current && (
+        <Modal title={`Adicionar exercício — Treino ${current.letra}`} onClose={() => setPickerOpen(false)}>
+          <div className="fj-pickerList">
+            {data.exercises.map((ex) => (
+              <button
+                key={ex.id}
+                className="fj-pickerList__item"
+                onClick={() => {
+                  addItem(student.id, current.id, ex);
+                  setPickerOpen(false);
+                }}
+              >
+                <span>{ex.nome}</span>
+                <span className="fj-setrep">{ex.series}x {ex.reps}</span>
+              </button>
+            ))}
+            {data.exercises.length === 0 && <p>Cadastre exercícios na aba Exercícios primeiro.</p>}
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------
+   ADMIN — FREQUÊNCIA E TERMÔMETRO DE UM ALUNO
+---------------------------------------------------------------------- */
+
+function AdminFrequencia({ student, data }) {
+  const days = useMemo(() => last14Dates(), []);
+  const logs = data.logs[student.id] || {};
+  const entries = days.map((d) => ({ ...d, log: logs[d.iso] }));
+  const withLog = entries.filter((e) => e.log);
+  const doneCount = withLog.filter((e) => e.log.done).length;
+  const skippedCount = withLog.filter((e) => e.log.skipped).length;
+  const rate = withLog.length ? Math.round((doneCount / withLog.length) * 100) : 0;
+  const thermoValues = withLog.map((e) => e.log.thermometer).filter(Boolean);
+  const avgThermo = thermoValues.length ? thermoValues.reduce((a, b) => a + b, 0) / thermoValues.length : null;
+
+  return (
+    <div>
+      <div className="fj-statsRow">
+        <div className="fj-stat">
+          <span className="fj-stat__value">{rate}%</span>
+          <span className="fj-stat__label">taxa de treinos feitos (14 dias)</span>
+        </div>
+        <div className="fj-stat">
+          <span className="fj-stat__value">
+            {doneCount} / {skippedCount}
+          </span>
+          <span className="fj-stat__label">feitos / pulados</span>
+        </div>
+        <div className="fj-stat">
+          <span className="fj-stat__value" style={{ color: avgThermo ? THERMO_LEVELS[Math.round(avgThermo) - 1].color : "var(--steel-light)" }}>
+            {avgThermo ? avgThermo.toFixed(1) : "—"}
+          </span>
+          <span className="fj-stat__label">média do termômetro</span>
+        </div>
+      </div>
+
+      <h4 className="fj-sectionTitle">Últimos 14 dias</h4>
+      <div className="fj-freqGrid">
+        {entries.map((e) => {
+          let bg = "var(--line)";
+          let title = `${prettyDate(e.iso)} — sem registro`;
+          if (e.log && e.log.done) {
+            bg = e.log.thermometer ? THERMO_LEVELS[e.log.thermometer - 1].color : "var(--lime)";
+            title = `${prettyDate(e.iso)} — Treino ${e.log.letra} feito`;
+          } else if (e.log && e.log.skipped) {
+            bg = "var(--rust-light)";
+            title = `${prettyDate(e.iso)} — Treino ${e.log.letra} pulado`;
+          }
+          return (
+            <div key={e.iso} className="fj-freqCell" style={{ background: bg }} title={title}>
+              <span>{WEEKDAY_SHORT[e.weekday][0]}</span>
+            </div>
+          );
+        })}
+      </div>
+      <div className="fj-freqLegend">
+        <span><i style={{ background: "var(--rust-light)" }} /> pulado</span>
+        <span><i style={{ background: "var(--lime)" }} /> feito</span>
+        <span><i style={{ background: "var(--line)" }} /> sem registro</span>
+      </div>
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------
+   ADMIN — ALUNOS (lista + detalhe)
+---------------------------------------------------------------------- */
+
+function AlunoForm({ initial, onSave, onCancel }) {
+  const [form, setForm] = useState(initial || { nome: "", plano: "academia" });
+  const [error, setError] = useState(false);
+
+  const handleSave = () => {
+    if (!form.nome.trim()) {
+      setError(true);
+      return;
+    }
+    onSave(form);
+  };
+
+  return (
+    <div className="fj-form">
+      <Field label="Nome do aluno">
+        <input value={form.nome} onChange={(e) => setForm((f) => ({ ...f, nome: e.target.value }))} autoFocus />
+      </Field>
+      {error && <p className="fj-formError">Dá um nome para o aluno antes de salvar.</p>}
+      <Field label="Plano">
+        <select value={form.plano} onChange={(e) => setForm((f) => ({ ...f, plano: e.target.value }))}>
+          <option value="academia">Treino na academia</option>
+          <option value="casa">Treino em casa</option>
+        </select>
+      </Field>
+      <div className="fj-form__actions">
+        <button type="button" className="fj-btn" onClick={onCancel}>
+          Cancelar
+        </button>
+        <button type="button" className="fj-btn fj-btn--primary" onClick={handleSave}>
+          Salvar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AdminAlunos({ data, saveStudent, deleteStudent, scheduleActions }) {
+  const [selectedId, setSelectedId] = useState(data.students[0] ? data.students[0].id : null);
+  const [tab, setTab] = useState("plano");
+  const [modal, setModal] = useState(null); // null | 'new' | 'edit'
+  const student = data.students.find((s) => s.id === selectedId) || null;
+
+  return (
+    <div className="fj-alunosLayout">
+      <div className="fj-alunosList">
+        <div className="fj-panel__head fj-panel__head--tight">
+          <h3>Alunos</h3>
+          <button className="fj-btn fj-btn--primary fj-btn--small" onClick={() => setModal("new")}>
+            <Plus size={14} /> Novo
+          </button>
+        </div>
+        {data.students.map((s) => {
+          const days14 = last14Dates();
+          const logs = data.logs[s.id] || {};
+          const withLog = days14.filter((d) => logs[d.iso]);
+          const done = withLog.filter((d) => logs[d.iso].done);
+          return (
+            <button
+              key={s.id}
+              className={`fj-alunoListItem ${s.id === selectedId ? "is-active" : ""}`}
+              onClick={() => setSelectedId(s.id)}
+            >
+              <div>
+                <div className="fj-alunoListItem__name">{s.nome}</div>
+                <Badge tone={s.plano === "casa" ? "steel" : "lime"}>{PLANO_LABEL[s.plano]}</Badge>
+              </div>
+              <span className="fj-alunoListItem__freq">{done.length}/{withLog.length}</span>
+            </button>
+          );
+        })}
+        {data.students.length === 0 && <p className="fj-muted">Nenhum aluno ainda.</p>}
+      </div>
+
+      <div className="fj-alunoDetail">
+        {!student ? (
+          <div className="fj-empty">
+            <Users size={28} />
+            <p>Selecione ou cadastre um aluno para montar o treino dele.</p>
+          </div>
+        ) : (
+          <>
+            <div className="fj-alunoDetail__head">
+              <div>
+                <h3>{student.nome}</h3>
+                <Badge tone={student.plano === "casa" ? "steel" : "lime"}>{PLANO_LABEL[student.plano]}</Badge>
+              </div>
+              <div className="fj-alunoDetail__actions">
+                <button className="fj-iconbtn" onClick={() => setModal("edit")} aria-label="Editar aluno">
+                  <Pencil size={15} />
+                </button>
+                <button
+                  className="fj-iconbtn fj-iconbtn--danger"
+                  onClick={() => {
+                    if (confirm(`Remover ${student.nome}? Isso apaga o plano e o histórico dele.`)) {
+                      deleteStudent(student.id);
+                      setSelectedId(null);
+                    }
+                  }}
+                  aria-label="Excluir aluno"
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            </div>
+
+            <div className="fj-tabs">
+              <button className={`fj-tabs__tab ${tab === "plano" ? "is-active" : ""}`} onClick={() => setTab("plano")}>
+                Plano semanal
+              </button>
+              <button className={`fj-tabs__tab ${tab === "freq" ? "is-active" : ""}`} onClick={() => setTab("freq")}>
+                Frequência e termômetro
+              </button>
+            </div>
+
+            {tab === "plano" ? (
+              <AdminPlanoSemanal student={student} data={data} {...scheduleActions} />
+            ) : (
+              <AdminFrequencia student={student} data={data} />
+            )}
+          </>
+        )}
+      </div>
+
+      {modal && (
+        <Modal title={modal === "new" ? "Novo aluno" : "Editar aluno"} onClose={() => setModal(null)}>
+          <AlunoForm
+            initial={modal === "edit" ? student : null}
+            onCancel={() => setModal(null)}
+            onSave={(form) => {
+              if (modal === "new") {
+                const id = uid("st");
+                saveStudent({ ...form, id });
+                setSelectedId(id);
+              } else {
+                saveStudent({ ...student, ...form });
+              }
+              setModal(null);
+            }}
+          />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------
+   APP
+---------------------------------------------------------------------- */
+
+function App() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [mode, setMode] = useState("aluno");
+  const [adminTab, setAdminTab] = useState("alunos");
+  const [currentStudentId, setCurrentStudentId] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      let loaded = null;
+      try {
+        const res = await window.storage.get(DATA_KEY, true);
+        loaded = res ? JSON.parse(res.value) : null;
+      } catch (e) {
+        loaded = null;
+      }
+      if (!loaded) {
+        loaded = buildDefaultData();
+        try {
+          await window.storage.set(DATA_KEY, JSON.stringify(loaded), true);
+        } catch (e) {
+          /* segue mesmo se não conseguir salvar */
+        }
+      } else {
+        const migrated = migrateData(loaded);
+        if (migrated !== loaded) {
+          loaded = migrated;
+          try {
+            await window.storage.set(DATA_KEY, JSON.stringify(loaded), true);
+          } catch (e) {
+            /* segue mesmo se não conseguir salvar */
+          }
+        }
+      }
+      if (!loaded.progress) loaded.progress = {};
+      let savedStudent = null;
+      try {
+        const res2 = await window.storage.get(CURRENT_STUDENT_KEY, false);
+        savedStudent = res2 ? res2.value : null;
+      } catch (e) {
+        savedStudent = null;
+      }
+      if (!cancelled) {
+        setData(loaded);
+        if (savedStudent && loaded.students.find((s) => s.id === savedStudent)) {
+          setCurrentStudentId(savedStudent);
+        }
+        setLoading(false);
+      }
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const persist = useCallback((next) => {
+    setData(next);
+    window.storage.set(DATA_KEY, JSON.stringify(next), true).catch(() => {});
+  }, []);
+
+  const handleSetCurrentStudent = useCallback((id) => {
+    setCurrentStudentId(id);
+    window.storage.set(CURRENT_STUDENT_KEY, id || "", false).catch(() => {});
+  }, []);
+
+  const exercisesById = useMemo(() => {
+    if (!data) return {};
+    const map = {};
+    data.exercises.forEach((e) => (map[e.id] = e));
+    return map;
+  }, [data]);
+
+  // ---- ações de treino (aluno) ----
+  const orderedDaysFor = useCallback((studentId) => activeRotation(data.schedules[studentId] || []), [data]);
+
+  const completeWorkout = useCallback(
+    (studentId, letra) => {
+      const iso = localISO(new Date());
+      const logId = uid("log");
+      const next = { ...data, logs: { ...data.logs }, progress: { ...data.progress } };
+      next.logs[studentId] = { ...(next.logs[studentId] || {}) };
+      next.logs[studentId][iso] = { id: logId, done: true, skipped: false, letra, thermometer: null };
+      const days = orderedDaysFor(studentId);
+      const prev = next.progress[studentId] || { pointerIndex: 0, pendingLogId: null };
+      const newPointer = days.length ? (prev.pointerIndex + 1) % days.length : 0;
+      next.progress[studentId] = {
+        pointerIndex: newPointer,
+        pendingLogId: logId,
+        lastLogId: logId,
+        lastIso: iso,
+        lastType: "done",
+        prevPointerIndex: prev.pointerIndex,
+      };
+      persist(next);
+    },
+    [data, persist, orderedDaysFor]
+  );
+
+  const skipWorkout = useCallback(
+    (studentId, letra) => {
+      const iso = localISO(new Date());
+      const logId = uid("log");
+      const next = { ...data, logs: { ...data.logs }, progress: { ...data.progress } };
+      next.logs[studentId] = { ...(next.logs[studentId] || {}) };
+      next.logs[studentId][iso] = { id: logId, done: false, skipped: true, letra, thermometer: null };
+      const days = orderedDaysFor(studentId);
+      const prev = next.progress[studentId] || { pointerIndex: 0, pendingLogId: null };
+      const newPointer = days.length ? (prev.pointerIndex + 1) % days.length : 0;
+      next.progress[studentId] = {
+        pointerIndex: newPointer,
+        pendingLogId: null,
+        lastLogId: logId,
+        lastIso: iso,
+        lastType: "skip",
+        prevPointerIndex: prev.pointerIndex,
+      };
+      persist(next);
+    },
+    [data, persist, orderedDaysFor]
+  );
+
+  const continueToNext = useCallback(
+    (studentId) => {
+      const next = { ...data, progress: { ...data.progress } };
+      const prev = next.progress[studentId] || { pointerIndex: 0, pendingLogId: null };
+      next.progress[studentId] = { ...prev, pendingLogId: null };
+      persist(next);
+    },
+    [data, persist]
+  );
+
+  const undoLast = useCallback(
+    (studentId) => {
+      const prev = (data.progress && data.progress[studentId]) || null;
+      if (!prev || !prev.lastLogId) return;
+      const next = { ...data, logs: { ...data.logs }, progress: { ...data.progress } };
+      next.logs[studentId] = { ...(next.logs[studentId] || {}) };
+      const logAtIso = next.logs[studentId][prev.lastIso];
+      if (logAtIso && logAtIso.id === prev.lastLogId) {
+        delete next.logs[studentId][prev.lastIso];
+      }
+      next.progress[studentId] = {
+        pointerIndex: prev.prevPointerIndex != null ? prev.prevPointerIndex : 0,
+        pendingLogId: null,
+        lastLogId: null,
+        lastIso: null,
+        lastType: null,
+        prevPointerIndex: null,
+      };
+      persist(next);
+    },
+    [data, persist]
+  );
+
+  const dismissSkipBanner = useCallback(
+    (studentId) => {
+      const next = { ...data, progress: { ...data.progress } };
+      const prev = next.progress[studentId] || {};
+      next.progress[studentId] = { ...prev, lastLogId: null, lastType: null };
+      persist(next);
+    },
+    [data, persist]
+  );
+
+  const setThermometer = useCallback(
+    (studentId, iso, level) => {
+      const next = { ...data, logs: { ...data.logs } };
+      next.logs[studentId] = { ...(next.logs[studentId] || {}) };
+      const prevLog = next.logs[studentId][iso] || {};
+      next.logs[studentId][iso] = { ...prevLog, thermometer: level };
+      persist(next);
+    },
+    [data, persist]
+  );
+
+  // ---- ações de exercícios (admin) ----
+  const saveExercise = useCallback(
+    (ex) => {
+      const exists = data.exercises.some((e) => e.id === ex.id);
+      const list = exists ? data.exercises.map((e) => (e.id === ex.id ? ex : e)) : [...data.exercises, ex];
+      persist({ ...data, exercises: list });
+    },
+    [data, persist]
+  );
+
+  const deleteExercise = useCallback(
+    (id) => {
+      if (!confirm("Excluir este exercício? Ele será removido dos planos que o usam.")) return;
+      const schedules = {};
+      Object.keys(data.schedules).forEach((sid) => {
+        schedules[sid] = (data.schedules[sid] || []).map((day) => ({
+          ...day,
+          items: day.items.filter((it) => it.exercicioId !== id),
+        }));
+      });
+      persist({ ...data, exercises: data.exercises.filter((e) => e.id !== id), schedules });
+    },
+    [data, persist]
+  );
+
+  // ---- ações de alunos (admin) ----
+  const saveStudent = useCallback(
+    (s) => {
+      const exists = data.students.some((x) => x.id === s.id);
+      const list = exists ? data.students.map((x) => (x.id === s.id ? s : x)) : [...data.students, s];
+      persist({ ...data, students: list });
+    },
+    [data, persist]
+  );
+
+  const deleteStudent = useCallback(
+    (id) => {
+      const students = data.students.filter((s) => s.id !== id);
+      const schedules = { ...data.schedules };
+      delete schedules[id];
+      const logs = { ...data.logs };
+      delete logs[id];
+      const progress = { ...data.progress };
+      delete progress[id];
+      persist({ ...data, students, schedules, logs, progress });
+    },
+    [data, persist]
+  );
+
+  // ---- ações de plano de treino por letra (admin) ----
+  const addWorkoutDay = useCallback(
+    (studentId) => {
+      const schedules = { ...data.schedules };
+      schedules[studentId] = [...(schedules[studentId] || []), { id: uid("day"), items: [] }];
+      persist({ ...data, schedules });
+    },
+    [data, persist]
+  );
+
+  const removeWorkoutDay = useCallback(
+    (studentId, dayId) => {
+      const schedules = { ...data.schedules };
+      schedules[studentId] = (schedules[studentId] || []).filter((d) => d.id !== dayId);
+      persist({ ...data, schedules });
+    },
+    [data, persist]
+  );
+
+  const moveWorkoutDay = useCallback(
+    (studentId, dayId, direction) => {
+      const arr = [...(data.schedules[studentId] || [])];
+      const idx = arr.findIndex((d) => d.id === dayId);
+      const swapIdx = idx + direction;
+      if (idx < 0 || swapIdx < 0 || swapIdx >= arr.length) return;
+      [arr[idx], arr[swapIdx]] = [arr[swapIdx], arr[idx]];
+      persist({ ...data, schedules: { ...data.schedules, [studentId]: arr } });
+    },
+    [data, persist]
+  );
+
+  const addItem = useCallback(
+    (studentId, dayId, ex) => {
+      const schedules = { ...data.schedules };
+      schedules[studentId] = (schedules[studentId] || []).map((d) =>
+        d.id === dayId
+          ? { ...d, items: [...d.items, { id: uid("it"), exercicioId: ex.id, series: ex.series, reps: ex.reps, particularidades: ex.particularidades, descanso: ex.descanso }] }
+          : d
+      );
+      persist({ ...data, schedules });
+    },
+    [data, persist]
+  );
+
+  const updateItem = useCallback(
+    (studentId, dayId, itemId, patch) => {
+      const schedules = { ...data.schedules };
+      schedules[studentId] = (schedules[studentId] || []).map((d) =>
+        d.id === dayId ? { ...d, items: d.items.map((it) => (it.id === itemId ? { ...it, ...patch } : it)) } : d
+      );
+      persist({ ...data, schedules });
+    },
+    [data, persist]
+  );
+
+  const removeItem = useCallback(
+    (studentId, dayId, itemId) => {
+      const schedules = { ...data.schedules };
+      schedules[studentId] = (schedules[studentId] || []).map((d) =>
+        d.id === dayId ? { ...d, items: d.items.filter((it) => it.id !== itemId) } : d
+      );
+      persist({ ...data, schedules });
+    },
+    [data, persist]
+  );
+
+  return (
+    <div className="fj-app">
+      <style>{CSS}</style>
+
+      <header className="fj-header">
+        <div className="fj-header__brand">
+          <Dumbbell size={22} />
+        </div>
+        <div className="fj-segmented">
+          <button className={mode === "aluno" ? "is-active" : ""} onClick={() => setMode("aluno")}>
+            <Home size={14} /> Área do aluno
+          </button>
+          <button className={mode === "admin" ? "is-active" : ""} onClick={() => setMode("admin")}>
+            <Settings size={14} /> Área do admin
+          </button>
+        </div>
+      </header>
+
+      <main className="fj-main">
+        {loading || !data ? (
+          <div className="fj-empty">
+            <p>Carregando...</p>
+          </div>
+        ) : mode === "aluno" ? (
+          <AlunoView
+            data={data}
+            exercisesById={exercisesById}
+            currentStudentId={currentStudentId}
+            setCurrentStudentId={handleSetCurrentStudent}
+            completeWorkout={completeWorkout}
+            skipWorkout={skipWorkout}
+            setThermometer={setThermometer}
+            continueToNext={continueToNext}
+            undoLast={undoLast}
+            dismissSkipBanner={dismissSkipBanner}
+          />
+        ) : (
+          <div className="fj-admin">
+            <div className="fj-tabs fj-tabs--top">
+              <button className={`fj-tabs__tab ${adminTab === "alunos" ? "is-active" : ""}`} onClick={() => setAdminTab("alunos")}>
+                <Users size={14} /> Alunos
+              </button>
+              <button className={`fj-tabs__tab ${adminTab === "exercicios" ? "is-active" : ""}`} onClick={() => setAdminTab("exercicios")}>
+                <ListChecks size={14} /> Exercícios
+              </button>
+            </div>
+            {adminTab === "alunos" ? (
+              <AdminAlunos
+                data={data}
+                saveStudent={saveStudent}
+                deleteStudent={deleteStudent}
+                scheduleActions={{ addWorkoutDay, removeWorkoutDay, moveWorkoutDay, addItem, updateItem, removeItem }}
+              />
+            ) : (
+              <AdminExercicios data={data} saveExercise={saveExercise} deleteExercise={deleteExercise} />
+            )}
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------
+   ESTILO
+---------------------------------------------------------------------- */
+
+const CSS = `
+.fj-app {
+  --ink: #14151A;
+  --graphite: #0E1013;
+  --steel: #40433D;
+  --steel-light: #83816F;
+  --chalk: #F7F4EC;
+  --paper: #FFFFFF;
+  --line: #E9E4D6;
+  --lime: #7BC492;
+  --lime-dark: #3E8F63;
+  --teal: #1F7A5C;
+  --rust: #5C7A3A;
+  --rust-light: #E4EBD4;
+  --danger: #D6483D;
+  --gradient: linear-gradient(135deg, var(--lime), var(--teal));
+  --current: #4CAF6D;
+  --current-dark: #3C8F57;
+  --shadow-sm: 0 1px 2px rgba(20,21,26,0.06), 0 1px 1px rgba(20,21,26,0.04);
+  --shadow-md: 0 8px 24px -8px rgba(20,21,26,0.18);
+  --shadow-glow: 0 6px 20px -6px rgba(62, 143, 99, 0.45);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: var(--chalk);
+  color: var(--ink);
+  min-height: 100vh;
+  position: relative;
+}
+.fj-app * { box-sizing: border-box; }
+.fj-app button, .fj-app input, .fj-app select { font-family: inherit; }
+
+.fj-header {
+  background: radial-gradient(120% 180% at 0% 0%, #1B1E22 0%, var(--graphite) 55%);
+  color: var(--chalk);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  flex-wrap: wrap;
+  gap: 10px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.fj-header__brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  background: var(--gradient);
+  color: var(--ink);
+  box-shadow: var(--shadow-glow);
+}
+.fj-segmented {
+  display: flex;
+  background: rgba(255,255,255,0.07);
+  border-radius: 999px;
+  padding: 3px;
+}
+.fj-segmented button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  color: var(--chalk);
+  opacity: 0.65;
+  padding: 8px 15px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.fj-segmented button.is-active {
+  background: var(--gradient);
+  color: var(--ink);
+  opacity: 1;
+  box-shadow: var(--shadow-glow);
+}
+.fj-main { padding: 20px 18px 40px; max-width: 860px; margin: 0 auto; }
+
+.fj-eyebrow { margin: 0; font-size: 13px; color: var(--steel-light); font-weight: 600; }
+.fj-h1 { margin: 0; font-size: 30px; font-family: "Arial Narrow", "Helvetica Neue Condensed", sans-serif; font-weight: 800; letter-spacing: -0.5px; }
+.fj-sectionTitle { font-size: 13px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--steel-light); margin: 22px 0 10px; font-weight: 800; }
+
+.fj-aluno__top { display: flex; justify-content: space-between; align-items: flex-start; }
+.fj-aluno__topRight { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+
+.fj-linklike { background: none; border: none; color: var(--rust); font-size: 12.5px; font-weight: 600; text-decoration: underline; cursor: pointer; padding: 0; }
+
+.fj-badge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 800; }
+.fj-badge--neutral { background: var(--line); color: var(--steel); }
+.fj-badge--lime { background: var(--gradient); color: var(--ink); }
+.fj-badge--steel { background: var(--ink); color: var(--chalk); }
+.fj-badge--rust { background: var(--rust-light); color: var(--rust); }
+
+.fj-rotationRow { display: flex; align-items: center; margin-top: 18px; }
+.fj-rotationPill {
+  position: relative;
+  font-size: 12px;
+  font-weight: 800;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--steel-light);
+  border: 2px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.2s ease;
+}
+.fj-rotationRow > .fj-rotationPill:not(:last-child) { margin-right: 22px; }
+.fj-rotationRow > .fj-rotationPill:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 2px;
+  background: var(--line);
+}
+.fj-rotationPill.is-current {
+  width: 36px;
+  height: 36px;
+  background: var(--current);
+  color: #FFFFFF;
+  border-color: transparent;
+  box-shadow: 0 6px 16px -4px rgba(60, 143, 87, 0.55);
+}
+
+.fj-actionRow { display: flex; gap: 10px; margin-top: 20px; }
+.fj-actionRow .fj-btn { flex: 1; }
+.fj-btn--ghost { background: var(--paper); color: var(--steel); border: 1.5px solid var(--line); }
+.fj-doneBox__continue { display: flex; justify-content: space-between; align-items: center; margin-top: 18px; }
+.fj-linklike--back { display: inline-flex; align-items: center; gap: 2px; color: var(--steel-light); }
+.fj-skipBanner { display: flex; justify-content: space-between; align-items: center; background: var(--rust-light); color: var(--rust); border-radius: 12px; padding: 11px 14px; margin-top: 16px; font-size: 13px; font-weight: 700; }
+.fj-skipBanner span { display: flex; align-items: center; gap: 6px; }
+.fj-skipBanner__actions { display: flex; align-items: center; gap: 4px; }
+.fj-skipBanner .fj-linklike { color: var(--rust); }
+.fj-iconbtn--flat { border: none; background: transparent; color: var(--rust); width: 24px; height: 24px; }
+
+.fj-daystrip { display: flex; gap: 6px; margin-top: 16px; overflow-x: auto; }
+.fj-daystrip__day {
+  position: relative;
+  flex: 1;
+  min-width: 44px;
+  padding: 10px 4px;
+  border-radius: 12px;
+  border: 1.5px solid var(--line);
+  background: var(--paper);
+  font-size: 11.5px;
+  font-weight: 800;
+  color: var(--steel-light);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.fj-daystrip__day.is-today { border-color: var(--rust); }
+.fj-daystrip__day.is-active { background: var(--ink); color: var(--lime); border-color: var(--ink); box-shadow: var(--shadow-md); }
+.fj-daystrip__dot { position: absolute; top: 5px; right: 6px; width: 5px; height: 5px; border-radius: 50%; background: var(--lime-dark); }
+.fj-daystrip__day.is-active .fj-daystrip__dot { background: var(--lime); }
+.fj-daystrip__add { flex: 0 0 auto; width: 40px; border-radius: 12px; border: 1.5px dashed var(--steel-light); background: transparent; color: var(--steel-light); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.15s ease; }
+.fj-daystrip__add:hover { border-color: var(--lime-dark); color: var(--lime-dark); }
+.fj-planToolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+.fj-exList { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.fj-exCard { display: flex; gap: 13px; background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; box-shadow: var(--shadow-sm); transition: box-shadow 0.2s ease; }
+.fj-exCard:hover { box-shadow: var(--shadow-md); }
+.fj-exCard__num { width: 28px; height: 28px; border-radius: 50%; background: var(--gradient); color: var(--ink); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 800; flex-shrink: 0; }
+.fj-exCard__body { flex: 1; min-width: 0; }
+.fj-exCard__head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.fj-exCard__head h4 { margin: 0; font-size: 15.5px; font-weight: 700; }
+.fj-exCard__meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+.fj-setrep { font-size: 12.5px; font-weight: 700; color: var(--steel); background: var(--chalk); padding: 4px 9px; border-radius: 999px; }
+.fj-videoBtn { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 700; color: var(--ink); background: var(--gradient); padding: 6px 10px; border-radius: 999px; text-decoration: none; white-space: nowrap; border: none; cursor: pointer; font-family: inherit; box-shadow: var(--shadow-glow); transition: transform 0.15s ease; }
+.fj-videoBtn:hover { transform: translateY(-1px); }
+.fj-videoWrap { position: relative; width: 100%; padding-bottom: 56.25%; height: 0; border-radius: 12px; overflow: hidden; background: var(--ink); }
+.fj-videoWrap iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+.fj-videoLinkModal__hint { font-size: 13.5px; color: var(--steel); margin: 0 0 12px; line-height: 1.5; }
+.fj-videoLinkModal__url { font-size: 12.5px; word-break: break-all; background: var(--chalk); border: 1.5px solid var(--line); border-radius: 10px; padding: 10px 12px; color: var(--steel); user-select: all; }
+
+.fj-restChip { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; font-weight: 700; color: var(--steel); background: var(--paper); border: 1.5px dashed var(--line); padding: 4px 9px 4px 7px; border-radius: 999px; cursor: pointer; transition: all 0.15s ease; }
+.fj-restChip:hover { border-color: var(--lime-dark); color: var(--lime-dark); }
+.fj-restTimer { display: flex; align-items: center; gap: 14px; margin-top: 12px; padding: 12px; background: var(--chalk); border-radius: 14px; }
+.fj-restTimer__ringWrap { position: relative; width: 64px; height: 64px; flex-shrink: 0; }
+.fj-restTimer__ring { width: 64px; height: 64px; transform: rotate(-90deg); }
+.fj-restTimer__track { fill: none; stroke: var(--line); stroke-width: 5; }
+.fj-restTimer__progress { fill: none; stroke: var(--lime-dark); stroke-width: 5; stroke-linecap: round; transition: stroke-dashoffset 1s linear; }
+.fj-restTimer.is-done .fj-restTimer__progress { stroke: var(--teal); }
+.fj-restTimer__time { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 16px; color: var(--ink); }
+.fj-restTimer__body { flex: 1; min-width: 0; }
+.fj-restTimer__label { margin: 0 0 8px; font-size: 12.5px; font-weight: 700; color: var(--steel); }
+.fj-restTimer__controls { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.fj-empty { text-align: center; color: var(--steel-light); padding: 36px 16px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.fj-empty--rest { padding: 22px 16px; background: var(--paper); border: 1.5px dashed var(--line); border-radius: 14px; }
+
+.fj-doneBox { margin-top: 20px; background: var(--paper); border: 1px solid var(--line); border-radius: 18px; padding: 18px; box-shadow: var(--shadow-md); }
+.fj-doneBox__confirmed { display: flex; align-items: center; gap: 8px; color: var(--lime-dark); font-weight: 800; font-size: 14px; }
+.fj-doneBox__ask { font-size: 13.5px; color: var(--steel-light); margin: 14px 0 8px; }
+
+.fj-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1.5px solid var(--line); background: var(--paper); color: var(--ink); font-weight: 700; font-size: 13.5px; padding: 10px 15px; border-radius: 12px; cursor: pointer; transition: all 0.15s ease; }
+.fj-btn:hover { transform: translateY(-1px); }
+.fj-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.fj-btn--primary { background: var(--gradient); color: var(--ink); border-color: transparent; box-shadow: var(--shadow-glow); }
+.fj-btn--big { width: 100%; padding: 14px; font-size: 14.5px; border-radius: 14px; }
+.fj-btn--small { padding: 6px 11px; font-size: 12.5px; border-radius: 9px; }
+
+.fj-thermo { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.fj-thermo__seg { width: 32px; height: 24px; border: none; border-radius: 8px; cursor: pointer; transition: transform 0.15s ease; }
+.fj-thermo__seg:hover { transform: translateY(-2px); }
+.fj-thermo__label { margin-left: 6px; font-size: 12.5px; font-weight: 800; }
+
+.fj-alunoPicker { text-align: center; padding: 20px 4px; }
+.fj-alunoPicker__list { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
+.fj-alunoPicker__item { display: flex; justify-content: space-between; align-items: center; background: var(--paper); border: 1px solid var(--line); padding: 14px 16px; border-radius: 14px; cursor: pointer; font-weight: 700; font-size: 15px; box-shadow: var(--shadow-sm); transition: all 0.15s ease; }
+.fj-alunoPicker__item:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
+
+.fj-panel__head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.fj-panel__head--tight { margin-bottom: 10px; margin-top: 14px; }
+.fj-panel__head h3, .fj-panel__head h4 { margin: 0; }
+
+.fj-tabs { display: flex; gap: 4px; border-bottom: 1.5px solid var(--line); margin: 14px 0 4px; }
+.fj-tabs--top { margin-top: 0; }
+.fj-tabs__tab { display: flex; align-items: center; gap: 6px; background: none; border: none; padding: 9px 4px; margin-right: 20px; font-weight: 700; font-size: 13.5px; color: var(--steel-light); cursor: pointer; border-bottom: 2.5px solid transparent; transition: all 0.15s ease; }
+.fj-tabs__tab.is-active { color: var(--ink); border-bottom: 2.5px solid var(--lime-dark); }
+
+.fj-exGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.fj-exGridCard { background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 15px; position: relative; box-shadow: var(--shadow-sm); transition: box-shadow 0.2s ease; }
+.fj-exGridCard:hover { box-shadow: var(--shadow-md); }
+.fj-exGridCard__top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.fj-exGridCard__top h4 { margin: 0; font-size: 15px; font-weight: 700; }
+.fj-exGridCard__tags { display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0; }
+.fj-exGridCard__actions { display: flex; gap: 6px; margin-top: 10px; justify-content: flex-end; }
+
+.fj-iconbtn { border: 1px solid var(--line); background: var(--paper); border-radius: 10px; width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: var(--steel); transition: all 0.15s ease; }
+.fj-iconbtn:hover:not(:disabled) { border-color: var(--lime-dark); color: var(--lime-dark); }
+.fj-iconbtn:disabled { opacity: 0.35; cursor: not-allowed; }
+.fj-iconbtn--danger { color: var(--danger); }
+.fj-iconbtn--danger:hover { border-color: var(--danger); color: var(--danger); }
+
+.fj-modal-backdrop { position: absolute; inset: 0; min-height: 100%; background: rgba(14,16,19,0.6); backdrop-filter: blur(2px); display: flex; align-items: flex-start; justify-content: center; padding: 16px; z-index: 50; }
+.fj-modal { background: var(--paper); border-radius: 20px; width: 100%; max-width: 420px; max-height: 88vh; overflow-y: auto; margin-top: 40px; box-shadow: var(--shadow-md); }
+.fj-modal--wide { max-width: 560px; }
+.fj-modal__head { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid var(--line); }
+.fj-modal__head h3 { margin: 0; font-size: 16px; font-weight: 800; }
+.fj-modal__body { padding: 20px; }
+
+.fj-form { display: flex; flex-direction: column; gap: 12px; }
+.fj-form__row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.fj-form__actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.fj-field { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; font-weight: 700; color: var(--steel); }
+.fj-field input, .fj-field select { font: inherit; font-weight: 500; padding: 10px 11px; border-radius: 10px; border: 1.5px solid var(--line); background: var(--chalk); color: var(--ink); transition: border-color 0.15s ease; }
+.fj-field input:focus, .fj-field select:focus { outline: none; border-color: var(--lime-dark); }
+.fj-formError { margin: -4px 0 0; font-size: 12px; color: var(--danger); font-weight: 700; }
+
+.fj-alunosLayout { display: grid; grid-template-columns: 230px 1fr; gap: 18px; }
+.fj-alunosList { display: flex; flex-direction: column; gap: 6px; }
+.fj-alunoListItem { display: flex; justify-content: space-between; align-items: center; gap: 8px; background: var(--paper); border: 1.5px solid var(--line); border-radius: 12px; padding: 10px 12px; cursor: pointer; text-align: left; transition: all 0.15s ease; }
+.fj-alunoListItem.is-active { border-color: var(--ink); background: var(--ink); box-shadow: var(--shadow-md); }
+.fj-alunoListItem.is-active .fj-alunoListItem__name { color: var(--chalk); }
+.fj-alunoListItem__name { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+.fj-alunoListItem__freq { font-size: 12px; font-weight: 800; color: var(--steel-light); }
+.fj-alunoDetail { min-width: 0; }
+.fj-alunoDetail__head { display: flex; justify-content: space-between; align-items: flex-start; }
+.fj-alunoDetail__head h3 { margin: 0 0 6px; }
+.fj-alunoDetail__actions { display: flex; gap: 6px; }
+
+.fj-planList { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.fj-planItem { display: flex; align-items: center; gap: 10px; background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; flex-wrap: wrap; }
+.fj-planItem__name { font-weight: 700; font-size: 13.5px; flex-basis: 100%; }
+.fj-planItem__inputs { display: flex; align-items: center; gap: 6px; flex: 1; flex-wrap: wrap; }
+.fj-planItem__inputs input { padding: 6px 8px; border-radius: 8px; border: 1.5px solid var(--line); font-size: 12.5px; }
+.fj-planItem__inputs input[type="number"] { width: 46px; }
+.fj-planItem__reps { width: 90px; }
+.fj-planItem__part { flex: 1; min-width: 140px; }
+.fj-planItem__x { font-weight: 700; color: var(--steel-light); }
+.fj-planItem__rest { display: flex; align-items: center; gap: 3px; background: var(--chalk); border-radius: 8px; padding: 4px 8px; color: var(--steel); }
+.fj-planItem__rest input { width: 36px; border: none !important; background: transparent !important; padding: 0 !important; text-align: right; }
+.fj-planItem__rest span { font-size: 12px; font-weight: 700; }
+
+.fj-pickerList { display: flex; flex-direction: column; gap: 6px; max-height: 50vh; overflow-y: auto; }
+.fj-pickerList__item { display: flex; justify-content: space-between; align-items: center; background: var(--chalk); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; cursor: pointer; font-weight: 700; font-size: 13.5px; transition: all 0.15s ease; }
+.fj-pickerList__item:hover { border-color: var(--lime-dark); }
+
+.fj-statsRow { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+.fj-stat { flex: 1; min-width: 120px; background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 16px; text-align: center; box-shadow: var(--shadow-sm); }
+.fj-stat__value { display: block; font-size: 26px; font-weight: 800; font-family: "Arial Narrow", sans-serif; background: var(--gradient); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.fj-stat__label { font-size: 11.5px; color: var(--steel-light); font-weight: 700; }
+
+.fj-freqGrid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+.fj-freqCell { aspect-ratio: 1; border-radius: 9px; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; color: rgba(0,0,0,0.35); transition: transform 0.15s ease; }
+.fj-freqCell:hover { transform: scale(1.12); }
+.fj-freqLegend { display: flex; gap: 14px; margin-top: 10px; flex-wrap: wrap; }
+.fj-freqLegend span { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--steel-light); font-weight: 600; }
+.fj-freqLegend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+.fj-muted { color: var(--steel-light); font-size: 13px; }
+
+@media (max-width: 640px) {
+  .fj-alunosLayout { grid-template-columns: 1fr; }
+  .fj-form__row { grid-template-columns: 1fr; }
+  .fj-exGrid { grid-template-columns: 1fr 1fr; }
+}
+`;
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
