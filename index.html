@@ -7,7 +7,34 @@
 <meta name="description" content="App de treino: área do aluno e área do admin/treinador." />
 </head>
 <body>
-<div id="root"></div>
+<div id="root">
+  <div style="font-family: system-ui, sans-serif; padding: 40px 20px; text-align: center; color: #666;">
+    Carregando o app...
+  </div>
+</div>
+<div id="fj-fatal-error" style="display:none; font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 20px 24px; border: 2px solid #D6483D; border-radius: 12px; background: #FFF5F4; color: #7A231C;">
+  <strong>Ocorreu um erro ao carregar o app.</strong>
+  <p style="margin: 10px 0 0; font-size: 14px; white-space: pre-wrap;" id="fj-fatal-error-msg"></p>
+</div>
+
+<script>
+  window.addEventListener("error", function (e) {
+    var box = document.getElementById("fj-fatal-error");
+    var msg = document.getElementById("fj-fatal-error-msg");
+    if (box && msg) {
+      box.style.display = "block";
+      msg.textContent = (e.error && e.error.stack) || e.message || String(e);
+    }
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    var box = document.getElementById("fj-fatal-error");
+    var msg = document.getElementById("fj-fatal-error-msg");
+    if (box && msg) {
+      box.style.display = "block";
+      msg.textContent = "Promise rejeitada: " + ((e.reason && e.reason.stack) || e.reason || String(e));
+    }
+  });
+</script>
 
 <script>
   // -----------------------------------------------------------------
@@ -51,7 +78,7 @@
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script type="text/babel" data-type="module" data-presets="react">
 import React, { useState, useEffect, useCallback, useMemo } from "https://esm.sh/react@18.3.1";
-import ReactDOM from "https://esm.sh/react-dom@18.3.1/client";
+import ReactDOM from "https://esm.sh/react-dom@18.3.1/client?external=react";
 import {
   Dumbbell,
   Home,
